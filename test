@@ -1,0 +1,249 @@
+import sys, re
+from pathlib import Path
+from datetime import date
+import pandas as pd
+from unidecode import unidecode
+
+# ==========================
+# CONFIG
+# ==========================
+MODE = "AGGREGATE"  
+# "AGGREGATE"  -> 1 seule colonne "Liste Finale" (multi-ligne)
+# "EXPAND"     -> développe une sélection de colonnes de la table finale
+
+# Colonnes finales à développer si MODE="EXPAND" (adapter aux libellés de ton export final)
+EXPAND_COLS_FINAL = [
+    "Status",          # ex: "Status"
+    "Prioritaire",     # ex: "Prioritaire"
+    "StatusJira"       # ex: "StatusJira"
+]
+
+# Ordre EXACT demandé pour la sortie (les colonnes absentes seront ignorées)
+OUTPUT_ORDER = [
+    "Id", "Titre", "Priorité", "Etat", "Demandé pour Nom",
+    "Affectation actuelle", "Groupe d'affectation Nom", "Responsable Nom",
+    "Nom de la phase", "Numéro de référence externe", "Date de création",
+    "Liste Finale"  # si MODE=AGGREGATE
+]
+
+# ==========================
+# Helpers robustes
+# ==========================
+def norm(s: str) -> str:
+    return " ".join(unidecode(str(s)).lower().strip().split())
+
+def pick_sheet(path: str, hint: str | None):
+    """Ouvre un Excel et choisit la feuille:
+       - si hint est fourni -> match insensible (normalisé)
+       - sinon -> 1ère feuille
+       Retourne (DataFrame, sheet_name_utilise)"""
+    xls = pd.ExcelFile(path)
+    if hint:
+        target = next((n for n in xls.sheet_names if norm(n) == norm(hint)), xls.sheet_names[0])
+    else:
+        target = xls.sheet_names[0]
+    return pd.read_excel(xls, sheet_name=target, dtype=str), target
+
+def map_cols(df: pd.DataFrame, aliases: dict[str, list[str]]) -> dict[str, str]:
+    """Construit un mapping 'nom_logique' -> 'nom reel' grâce aux alias tolérants (accents/espaces/majuscules)."""
+    look = {norm(c): c for c in df.columns}
+    out = {}
+    for logical, opts in aliases.items():
+        for o in opts:
+            if norm(o) in look:
+                out[logical] = look[norm(o)]
+                break
+    return out
+
+# ==========================
+# Construction de "Liste Finale" (mode AGGREGATE)
+# ==========================
+def build_liste_finale_aggregate(fin_df: pd.DataFrame, mfin: dict) -> pd.DataFrame:
+    """Regroupe Finale par Id et concatène en un texte multi-lignes:
+       (date jj/mm/aa : Status ; StatutFinale ; Phase ; Commentaire)"""
+    id_col = mfin["id"]
+    keep = {id_col}
+    for k in ("datecrea", "phase", "statut", "statut_finale", "commentaire"):
+        if mfin.get(k): keep.add(mfin[k])
+    fin_small = fin_df[[c for c in fin_df.columns if c in keep]].copy()
+
+    # tri chronologique si date présente
+    if mfin.get("datecrea") and mfin["datecrea"] in fin_small.columns:
+        fin_small["_dt"] = pd.to_datetime(fin_small[mfin["datecrea"]], errors="coerce")
+        fin_small = fin_small.sort_values([id_col, "_dt"], na_position="first")
+
+    def one_line(row):
+        parts = []
+        # date jj/mm/aa si possible
+        if mfin.get("datecrea"):
+            d = row.get(mfin["datecrea"], "")
+            if d:
+                try:
+                    dt = pd.to_datetime(d, errors="coerce")
+                    d = dt.strftime("%d/%m/%y") if pd.notna(dt) else str(d)
+                except Exception:
+                    d = str(d)
+                parts.append(f"{d} :")
+        # autres champs
+        for key in ("statut", "statut_finale", "phase", "commentaire"):
+            col = mfin.get(key)
+            if col:
+                v = str(row.get(col, "")).strip()
+                if v:
+                    parts.append(v)
+        return " ".join(parts).strip()
+
+    agg = fin_small.groupby(id_col, dropna=False).apply(
+        lambda g: "\n".join(
+            [s for s in (one_line(r) for r in g.fillna("").to_dict("records")) if s]
+        )
+    ).reset_index(name="Liste Finale")
+
+    return agg.rename(columns={id_col: "Id"})
+
+# ==========================
+# Développement de colonnes (mode EXPAND)
+# ==========================
+def build_liste_finale_expand(fin_df: pd.DataFrame, mfin: dict, expand_cols: list[str]) -> pd.DataFrame:
+    """Ne garde que Id + colonnes souhaitées de Finale, renomme proprement."""
+    use = {"Id": mfin["id"]}
+    for col in expand_cols:
+        # essaie de retrouver la colonne correspondante en tolérant les variantes
+        candidates = [c for c in fin_df.columns if norm(c) == norm(col)]
+        if candidates:
+            use[col] = candidates[0]
+        else:
+            # si l'alias existait déjà dans mfin (ex: 'statut'), le réutiliser
+            if col.lower() == "status" and mfin.get("statut"):
+                use[col] = mfin["statut"]
+            elif col.lower() in ("statutfinale", "statutfinale") and mfin.get("statut_finale"):
+                use[col] = mfin["statut_finale"]
+            elif col.lower() in ("phase", "nom de la phase"):
+                use[col] = mfin.get("phase") or mfin.get("phase_finale")
+
+    keep_real = [v for v in use.values() if v]
+    fin_small = fin_df[[c for c in fin_df.columns if c in keep_real]].copy()
+    fin_small.rename(columns={v: k for k, v in use.items() if v}, inplace=True)
+    return fin_small
+
+# ==========================
+# PIPELINE PRINCIPAL
+# ==========================
+def run_pipeline(dem_path, dem_sheet_hint, fin_path, fin_sheet_hint, out_dir):
+    dem, used_dem = pick_sheet(dem_path, dem_sheet_hint if dem_sheet_hint else None)
+    fin, used_fin = pick_sheet(fin_path, fin_sheet_hint if fin_sheet_hint else None)
+    print(f"Feuilles utilisées -> Demande: {used_dem} | Finale: {used_fin}")
+
+    # Aliases tolérants
+    aliases_dem = {
+        "id": ["Id", "ID", "Identifiant"],
+
+        "titre": ["Titre"],
+        "priorite": ["Priorité", "Priorite"],
+        "etat": ["Etat", "Status", "State"],
+        "demande_pour": ["Demandé pour Nom", "Demande pour Nom", "Requester"],
+        "affectation_actuelle": ["Affectation actuelle", "Affectation"],
+        "groupe_aff": ["Groupe d'affectation Nom", "Groupe d’affectation Nom", "Groupe d affectation Nom", "Assignment group"],
+        "responsable": ["Responsable Nom", "Assigned to"],
+        "phase": ["Nom de la phase", "Phase"],
+        "ref_ext": ["Numéro de référence externe", "Numero de reference externe", "External reference"],
+        "date_crea_dem": ["Date de création", "Date/heure de création", "Date/heure de creation", "Date creation", "Date de creation"],
+        "dept": ["Departement", "Department"],
+    }
+    aliases_fin = {
+        "id": ["Id", "ID", "Identifiant"],
+        "datecrea": ["Date de création", "Date/heure de création", "Date/heure de creation", "Date creation", "Date de creation"],
+        "phase": ["Nom de la phase", "Phase"],
+        "statut": ["Statut", "Status"],
+        "statut_finale": ["StatutFinale", "Statut Finale", "Final status"],
+        "commentaire": ["Commentaire", "Commentaires", "Notes", "Description"],
+    }
+
+    mdem = map_cols(dem, aliases_dem)
+    mfin = map_cols(fin, aliases_fin)
+
+    if "id" not in mdem or "id" not in mfin:
+        raise ValueError("Colonne 'Id' introuvable dans l’un des fichiers.")
+
+    # Filtre (Etat != Terminé/Annulé + Département = NANTERRE SGFI) si colonnes présentes
+    if "etat" in mdem and "dept" in mdem:
+        dem = dem[
+            (~dem[mdem["etat"]].str.lower().isin(["terminé", "termine", "annulé", "annule"])) &
+            (dem[mdem["dept"]].str.upper() == "NANTERRE SGFI")
+        ].copy()
+
+    # Normalise les entêtes côté Demande
+    ren = {
+        mdem["id"]: "Id",
+        mdem.get("titre", ""): "Titre",
+        mdem.get("priorite", ""): "Priorité",
+        mdem.get("etat", ""): "Etat",
+        mdem.get("demande_pour", ""): "Demandé pour Nom",
+        mdem.get("affectation_actuelle", ""): "Affectation actuelle",
+        mdem.get("groupe_aff", ""): "Groupe d'affectation Nom",
+        mdem.get("responsable", ""): "Responsable Nom",
+        mdem.get("phase", ""): "Nom de la phase",
+        mdem.get("ref_ext", ""): "Numéro de référence externe",
+        mdem.get("date_crea_dem", ""): "Date de création",
+    }
+    dem.rename(columns={k: v for k, v in ren.items() if k}, inplace=True)
+
+    # Branche finale selon mode
+    if MODE.upper() == "AGGREGATE":
+        finale_block = build_liste_finale_aggregate(fin, mfin)  # -> Id + Liste Finale
+    else:  # EXPAND
+        finale_block = build_liste_finale_expand(fin, mfin, EXPAND_COLS_FINAL)  # -> Id + colonnes finales choisies
+        # s'assurer que la clé join est bien "Id"
+        if "Id" not in finale_block.columns:
+            # au cas où, renommer la clé
+            key = next((c for c in finale_block.columns if norm(c) == "id"), None)
+            if key: finale_block.rename(columns={key: "Id"}, inplace=True)
+
+    # Jointure externe entière
+    merged = pd.merge(dem, finale_block, on="Id", how="outer").fillna("")
+
+    # Ordre de colonnes
+    order = [c for c in OUTPUT_ORDER if c in merged.columns]
+    merged = merged[order + [c for c in merged.columns if c not in order]]
+
+    # Export
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"Suivi_Fusion_{date.today():%Y%m%d}.xlsx"
+    merged.to_excel(out_path, index=False)
+
+    # Wrap text sur "Liste Finale" si présente
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(out_path)
+        ws = wb.active
+        header = {cell.value: cell.column for cell in ws[1]}
+        if "Liste Finale" in header:
+            col = header["Liste Finale"]
+            for r in ws.iter_rows(min_row=2, min_col=col, max_col=col):
+                for cell in r:
+                    cell.alignment = cell.alignment.copy(wrapText=True)
+        wb.save(out_path)
+    except Exception:
+        pass
+
+    print(f"✅ Fichier généré : {out_path}")
+
+# ==========================
+# Entrée CLI
+# ==========================
+if __name__ == "__main__":
+    """
+    Usage :
+      python fusion_process.py <Demande.xlsx> <FeuilleDemande|''> <Finale.xlsx> <FeuilleFinale|''> <out_dir>
+
+    Exemples :
+      python fusion_process.py "C:\\X\\Demande.xlsx" "Liste Demande" "C:\\X\\Suivi_de_PROD.xlsx" "ListeFinale" "C:\\X\\out"
+      python fusion_process.py "C:\\X\\Demande.xlsx" ""              "C:\\X\\Suivi_de_PROD.xlsx" ""            "C:\\X\\out"
+    """
+    if len(sys.argv) != 6:
+        print("Usage: python fusion_process.py <Demande.xlsx> <FeuilleDemande|''> <Finale.xlsx> <FeuilleFinale|''> <out_dir>")
+        sys.exit(1)
+
+    dem_path, dem_sheet, fin_path, fin_sheet, out_dir = sys.argv[1:]
+    run_pipeline(dem_path, dem_sheet, fin_path, fin_sheet, out_dir)
