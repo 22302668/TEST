@@ -1,3 +1,6 @@
+pip install pandas openpyxl unidecode
+
+
 import sys, re
 from pathlib import Path
 from datetime import date
